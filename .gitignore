@@ -1,0 +1,4 @@
+# Machine-specific keys swapped between the two hosts; never commit.
+exchange/*
+!exchange/.keep
+*.retry

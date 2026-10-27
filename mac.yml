@@ -1,0 +1,116 @@
+---
+# Run on the Mac as your normal user (no sudo):  ansible-playbook mac.yml
+# Needs exchange/u26_info.yml from the u26 run; writes exchange/mac_info.yml for the u26.
+- name: Mac side of the u26 link
+  hosts: localhost
+  gather_facts: true
+  vars:
+    d: "{{ ansible_env.HOME }}/{{ mac_link_dirname }}"
+    u26_info_file: "{{ exchange_dir }}/u26_info.yml"
+
+  handlers:
+    - name: Restart sshd
+      ansible.builtin.shell: 'kill "$(cat {{ d }}/sshd.pid)" 2>/dev/null; sleep 1; true'
+      changed_when: true
+    - name: Restart tunnel
+      ansible.builtin.shell: 'kill "$(cat {{ d }}/tunnel.pid)" 2>/dev/null; sleep 1; true'
+      changed_when: true
+
+  pre_tasks:
+    - name: Require the u26 info file
+      ansible.builtin.assert:
+        that: u26_info_file is file
+        fail_msg: "Missing {{ u26_info_file }}. Run u26.yml on the u26 first and copy this folder over."
+
+    - name: Load u26 info
+      ansible.builtin.include_vars:
+        file: "{{ u26_info_file }}"
+
+  tasks:
+    - name: State directory
+      ansible.builtin.file:
+        path: "{{ d }}"
+        state: directory
+        mode: "0700"
+
+    - name: Host key for the user-level sshd
+      ansible.builtin.command: ssh-keygen -q -t ed25519 -N "" -C mac-link-sshd -f {{ d }}/ssh_host_ed25519_key
+      args:
+        creates: "{{ d }}/ssh_host_ed25519_key"
+
+    - name: Key used to hold the tunnel to the u26
+      ansible.builtin.command: ssh-keygen -q -t ed25519 -N "" -C "{{ ansible_user_id }}@mac->u26-tunnel" -f {{ d }}/tunnel_key
+      args:
+        creates: "{{ d }}/tunnel_key"
+
+    # Only connections arriving through the tunnel (loopback) may use the u26 key.
+    - name: Authorize the u26 key
+      ansible.builtin.copy:
+        dest: "{{ d }}/authorized_keys"
+        mode: "0600"
+        content: |
+          from="127.0.0.1,::1" {{ u26_user_pubkey }}
+
+    - name: Trust the u26 host key
+      ansible.builtin.copy:
+        dest: "{{ d }}/known_hosts"
+        mode: "0600"
+        content: |
+          u26 {{ u26_hostkey }}
+
+    - name: User-level sshd config
+      ansible.builtin.template:
+        src: templates/mac-sshd_config.j2
+        dest: "{{ d }}/sshd_config"
+        mode: "0600"
+        validate: /usr/sbin/sshd -t -f %s
+      notify: Restart sshd
+
+    - name: Watchdog script
+      ansible.builtin.template:
+        src: templates/mac-watchdog.sh.j2
+        dest: "{{ d }}/watchdog.sh"
+        mode: "0755"
+      notify: Restart tunnel
+
+    - name: Run the watchdog every minute
+      ansible.builtin.cron:
+        name: mac-link watchdog
+        job: "{{ d }}/watchdog.sh"
+
+    - name: Run the watchdog at boot
+      ansible.builtin.cron:
+        name: mac-link watchdog (boot)
+        special_time: reboot
+        job: "sleep 30 && {{ d }}/watchdog.sh"
+
+    - name: Apply pending restarts
+      ansible.builtin.meta: flush_handlers
+
+    - name: Start sshd and tunnel now
+      ansible.builtin.command: "{{ d }}/watchdog.sh"
+      changed_when: false
+
+    - name: Read Mac public keys
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      loop:
+        - "{{ d }}/tunnel_key.pub"
+        - "{{ d }}/ssh_host_ed25519_key.pub"
+      register: mac_keys
+
+    - name: Export Mac info for the u26 playbook
+      ansible.builtin.copy:
+        dest: "{{ exchange_dir }}/mac_info.yml"
+        mode: "0644"
+        content: |
+          mac_user: "{{ ansible_user_id }}"
+          mac_tunnel_pubkey: "{{ (mac_keys.results[0].content | b64decode).split()[:2] | join(' ') }}"
+          mac_sshd_hostkey: "{{ (mac_keys.results[1].content | b64decode).split()[:2] | join(' ') }}"
+
+    - name: Next step
+      ansible.builtin.debug:
+        msg: >-
+          Copy exchange/mac_info.yml to the u26, e.g.
+          scp {{ exchange_dir }}/mac_info.yml <u26-user>@{{ tb_u26_ip }}:<repo>/exchange/
+          then re-run u26.yml there. Logs: {{ d }}/*.log

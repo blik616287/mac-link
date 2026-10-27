@@ -1,0 +1,19 @@
+---
+# ---- Thunderbolt link (u26 owns the subnet and hands the Mac an address by DHCP) ----
+tb_interface: thunderbolt0
+tb_u26_ip: 10.77.0.1
+tb_prefix: 24
+tb_subnet: 10.77.0.0/24
+
+# ---- u26 ----
+u26_ssh_port: 22
+tunnel_user: mactunnel     # restricted account the Mac logs into to hold the tunnel open
+tunnel_port: 2222          # u26 loopback port that leads to the Mac's sshd
+
+# ---- Mac ----
+mac_sshd_port: 2222        # Mac loopback port of the user-level sshd
+mac_share_path: ""         # path on the Mac to mount on the u26; "" = Mac home dir
+mac_link_dirname: .u26link # state dir in the Mac home
+
+# Public keys / host keys are swapped between the two machines through this folder.
+exchange_dir: "{{ playbook_dir }}/exchange"

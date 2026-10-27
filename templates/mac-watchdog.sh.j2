@@ -1,0 +1,43 @@
+#!/bin/bash
+# Managed by Ansible (mac-link). Runs every minute from cron: keeps the user-level
+# sshd and the reverse tunnel to the u26 alive, restarting whichever is down.
+set -u
+D="{{ d }}"
+LOG="$D/watchdog.log"
+LOCK="$D/watchdog.lock"
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+
+/usr/bin/shlock -f "$LOCK" -p $$ || exit 0
+trap 'rm -f "$LOCK"' EXIT
+
+for f in "$LOG" "$D/sshd.log" "$D/tunnel.log"; do
+  [ -f "$f" ] && [ "$(stat -f %z "$f")" -gt 1048576 ] && mv "$f" "$f.1"
+done
+
+# alive PIDFILE PATTERN: the pid is running and its command line contains PATTERN
+alive() {
+  local pid
+  pid=$(cat "$1" 2>/dev/null) || return 1
+  [ -n "$pid" ] && ps -p "$pid" -o command= 2>/dev/null | grep -qF -- "$2"
+}
+
+if ! alive "$D/sshd.pid" "$D/sshd_config"; then
+  log "starting sshd on 127.0.0.1:{{ mac_sshd_port }}"
+  /usr/sbin/sshd -f "$D/sshd_config" -E "$D/sshd.log" || log "sshd failed to start, see $D/sshd.log"
+fi
+
+# ssh exits on its own when the link dies (ServerAlive) or the remote port is
+# still held by a dead session (ExitOnForwardFailure); the next run retries.
+if ! alive "$D/tunnel.pid" "$D/tunnel_key"; then
+  log "starting tunnel to {{ tunnel_user }}@{{ tb_u26_ip }}"
+  nohup /usr/bin/ssh -N -F /dev/null \
+    -i "$D/tunnel_key" -o IdentitiesOnly=yes -o BatchMode=yes \
+    -o UserKnownHostsFile="$D/known_hosts" -o StrictHostKeyChecking=yes -o HostKeyAlias=u26 \
+    -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+    -o ExitOnForwardFailure=yes -o Ciphers=aes128-gcm@openssh.com,chacha20-poly1305@openssh.com \
+    -R 127.0.0.1:{{ tunnel_port }}:127.0.0.1:{{ mac_sshd_port }} \
+    -p {{ u26_ssh_port }} {{ tunnel_user }}@{{ tb_u26_ip }} \
+    </dev/null >>"$D/tunnel.log" 2>&1 &
+  echo $! >"$D/tunnel.pid"
+fi

@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Managed by Ansible (mac-link). Runs every minute from cron: keeps the Mac's
+# filesystem mounted at MP through the reverse tunnel, remounting when it goes stale.
+set -u
+export PATH=/usr/local/bin:/usr/bin:/bin
+
+MP="{{ u26_mount_point }}"
+REMOTE="mac:{{ mac_share_path }}"
+STATE="$HOME/.local/state/mac-link"
+LOG="$STATE/mount.log"
+
+mkdir -p "$STATE"
+exec 9>"$STATE/mount.lock"
+flock -n 9 || exit 0
+
+# Log only when the status changes, so an absent Mac doesn't log every minute.
+note() {
+  [ "$(cat "$STATE/status" 2>/dev/null)" = "$1" ] && return
+  echo "$1" >"$STATE/status"
+  printf '%s %s\n' "$(date '+%F %T')" "$2" >>"$LOG"
+}
+[ -f "$LOG" ] && [ "$(stat -c %s "$LOG")" -gt 1048576 ] && mv "$LOG" "$LOG.1"
+
+# /proc/mounts never blocks, unlike stat() on a dead sshfs mount.
+mounted() { grep -qs " $MP fuse.sshfs " /proc/mounts; }
+
+if mounted && timeout 10 ls "$MP" >/dev/null 2>&1; then
+  note up "mounted $REMOTE at $MP"
+  exit 0
+fi
+
+if mounted; then
+  printf '%s %s\n' "$(date '+%F %T')" "stale mount, detaching" >>"$LOG"
+  fusermount3 -uz "$MP" 2>/dev/null
+fi
+
+if ! timeout 15 ssh -o BatchMode=yes mac true 2>/dev/null; then
+  note down "mac not reachable through the tunnel (waiting for it to reconnect)"
+  exit 0
+fi
+
+mkdir -p "$MP"
+if sshfs "$REMOTE" "$MP" -o BatchMode=yes,reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,idmap=user,follow_symlinks 2>>"$LOG"; then
+  note up "mounted $REMOTE at $MP"
+else
+  note failed "sshfs mount failed"
+fi

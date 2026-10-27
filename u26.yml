@@ -1,0 +1,240 @@
+---
+# Run on the u26 (Ubuntu):  ansible-playbook u26.yml -K
+# First run: sets up Thunderbolt networking, sshd and keys, and exports exchange/u26_info.yml.
+# Re-run after the Mac playbook has written exchange/mac_info.yml to finish the tunnel + mount.
+- name: U26 side of the Mac link
+  hosts: localhost
+  gather_facts: true
+  vars:
+    u26_mount_point: "{{ ansible_env.HOME }}/mac"
+    mac_key: "{{ ansible_env.HOME }}/.ssh/id_ed25519_mac"
+    tunnel_home: "/var/lib/{{ tunnel_user }}"
+    mac_info_file: "{{ exchange_dir }}/mac_info.yml"
+
+  handlers:
+    - name: Reload sshd
+      become: true
+      ansible.builtin.systemd:
+        name: ssh
+        state: reloaded
+
+  tasks:
+    # ---------------------------------------------------------------- packages
+    - name: Install sshd and sshfs
+      become: true
+      ansible.builtin.apt:
+        name: [openssh-server, sshfs, fuse3]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    # ------------------------------------------------------- thunderbolt link
+    - name: Load thunderbolt_net at boot
+      become: true
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/thunderbolt-net.conf
+        content: "thunderbolt_net\n"
+        mode: "0644"
+
+    - name: Load thunderbolt_net now
+      become: true
+      ansible.builtin.command: modprobe thunderbolt_net
+      changed_when: false
+
+    # "shared" makes NetworkManager run a DHCP server on the link, so the Mac's
+    # Thunderbolt Bridge (DHCP by default) gets an address without admin rights.
+    - name: NetworkManager profile for the Thunderbolt link
+      become: true
+      ansible.builtin.shell: |
+        set -eo pipefail
+        if ! nmcli -t -f NAME con show | grep -qx tb-mac; then
+          nmcli con add type ethernet ifname {{ tb_interface }} con-name tb-mac
+          echo CREATED
+        fi
+        nmcli con mod tb-mac connection.autoconnect yes \
+          ipv4.method shared ipv4.addresses {{ tb_u26_ip }}/{{ tb_prefix }} \
+          ipv6.method link-local
+      args:
+        executable: /bin/bash
+      register: nm_profile
+      changed_when: "'CREATED' in nm_profile.stdout"
+
+    - name: Bring the Thunderbolt link up (no-op if the cable is unplugged)
+      become: true
+      ansible.builtin.command: nmcli con up tb-mac
+      register: nm_up
+      changed_when: nm_up.rc == 0
+      failed_when: false
+
+    # -------------------------------------------------------------------- sshd
+    - name: Enable sshd
+      become: true
+      ansible.builtin.service:
+        name: ssh
+        enabled: true
+        state: started
+
+    - name: Restricted tunnel account
+      become: true
+      ansible.builtin.user:
+        name: "{{ tunnel_user }}"
+        system: true
+        home: "{{ tunnel_home }}"
+        create_home: true
+        shell: /usr/sbin/nologin
+        password: "*"
+
+    # Appended at the end of sshd_config so the Match block cannot swallow other settings.
+    - name: Lock the tunnel account down to a single reverse forward
+      become: true
+      ansible.builtin.blockinfile:
+        path: /etc/ssh/sshd_config
+        marker: "# {mark} mac-link (managed by Ansible)"
+        insertafter: EOF
+        validate: /usr/sbin/sshd -t -f %s
+        block: |
+          Match User {{ tunnel_user }}
+              PasswordAuthentication no
+              KbdInteractiveAuthentication no
+              AllowTcpForwarding remote
+              PermitListen 127.0.0.1:{{ tunnel_port }}
+              AllowAgentForwarding no
+              X11Forwarding no
+              PermitTTY no
+              ForceCommand /usr/sbin/nologin
+              ClientAliveInterval 15
+              ClientAliveCountMax 3
+      notify: Reload sshd
+
+    - name: Check whether ufw is active
+      become: true
+      ansible.builtin.command: ufw status
+      register: ufw_status
+      changed_when: false
+      failed_when: false
+
+    - name: Allow ssh and DHCP on the Thunderbolt link through ufw
+      become: true
+      ansible.builtin.command: "ufw allow in on {{ tb_interface }} to any port {{ item }}"
+      loop: ["{{ u26_ssh_port }} proto tcp", "67 proto udp"]
+      register: ufw_rule
+      changed_when: "'Skipping' not in ufw_rule.stdout"
+      when: "'Status: active' in ufw_status.stdout"
+
+    # -------------------------------------------------------------- keys out
+    - name: Ensure ~/.ssh
+      ansible.builtin.file:
+        path: "{{ ansible_env.HOME }}/.ssh"
+        state: directory
+        mode: "0700"
+
+    - name: Key the u26 uses to log into the Mac
+      ansible.builtin.command: >-
+        ssh-keygen -q -t ed25519 -N "" -C "{{ ansible_user_id }}@{{ ansible_hostname }}->mac"
+        -f {{ mac_key }}
+      args:
+        creates: "{{ mac_key }}"
+
+    - name: Read u26 public keys
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      loop:
+        - "{{ mac_key }}.pub"
+        - /etc/ssh/ssh_host_ed25519_key.pub
+      register: u26_keys
+
+    - name: Export u26 keys for the Mac playbook
+      ansible.builtin.copy:
+        dest: "{{ exchange_dir }}/u26_info.yml"
+        mode: "0644"
+        content: |
+          u26_user_pubkey: "{{ (u26_keys.results[0].content | b64decode).split()[:2] | join(' ') }}"
+          u26_hostkey: "{{ (u26_keys.results[1].content | b64decode).split()[:2] | join(' ') }}"
+
+    # ---------------------------------------------- needs the Mac's info file
+    - name: Load Mac info
+      ansible.builtin.include_vars:
+        file: "{{ mac_info_file }}"
+      when: mac_info_file is file
+
+    - name: Finish the tunnel and mount
+      when: mac_info_file is file
+      block:
+        - name: Tunnel account ~/.ssh
+          become: true
+          ansible.builtin.file:
+            path: "{{ tunnel_home }}/.ssh"
+            state: directory
+            owner: "{{ tunnel_user }}"
+            group: "{{ tunnel_user }}"
+            mode: "0700"
+
+        - name: Authorize the Mac's tunnel key (forward-only, Thunderbolt subnet only)
+          become: true
+          ansible.builtin.copy:
+            dest: "{{ tunnel_home }}/.ssh/authorized_keys"
+            owner: "{{ tunnel_user }}"
+            group: "{{ tunnel_user }}"
+            mode: "0600"
+            content: |
+              restrict,port-forwarding,permitlisten="127.0.0.1:{{ tunnel_port }}",from="{{ tb_subnet }}" {{ mac_tunnel_pubkey }}
+
+        - name: Trust the Mac's sshd host key
+          ansible.builtin.known_hosts:
+            name: mac-link
+            key: "mac-link {{ mac_sshd_hostkey }}"
+            path: "{{ ansible_env.HOME }}/.ssh/known_hosts"
+
+        - name: SSH alias "mac"
+          ansible.builtin.blockinfile:
+            path: "{{ ansible_env.HOME }}/.ssh/config"
+            create: true
+            mode: "0600"
+            insertbefore: BOF
+            marker: "# {mark} mac-link (managed by Ansible)"
+            block: |
+              Host mac
+                  HostName 127.0.0.1
+                  Port {{ tunnel_port }}
+                  User {{ mac_user }}
+                  HostKeyAlias mac-link
+                  IdentityFile {{ mac_key }}
+                  IdentitiesOnly yes
+                  Ciphers aes128-gcm@openssh.com,chacha20-poly1305@openssh.com
+                  ServerAliveInterval 15
+                  ServerAliveCountMax 3
+                  ConnectTimeout 10
+
+        - name: Ensure ~/.local/bin
+          ansible.builtin.file:
+            path: "{{ ansible_env.HOME }}/.local/bin"
+            state: directory
+            mode: "0755"
+
+        - name: Mount watchdog script
+          ansible.builtin.template:
+            src: templates/u26-mac-mount.sh.j2
+            dest: "{{ ansible_env.HOME }}/.local/bin/mac-link-mount"
+            mode: "0755"
+
+        - name: Run the mount watchdog every minute
+          ansible.builtin.cron:
+            name: mac-link mount watchdog
+            job: "{{ ansible_env.HOME }}/.local/bin/mac-link-mount"
+
+        - name: Run the mount watchdog at boot
+          ansible.builtin.cron:
+            name: mac-link mount watchdog (boot)
+            special_time: reboot
+            job: "sleep 30 && {{ ansible_env.HOME }}/.local/bin/mac-link-mount"
+
+        - name: Try mounting now
+          ansible.builtin.command: "{{ ansible_env.HOME }}/.local/bin/mac-link-mount"
+          changed_when: false
+
+    - name: Next step
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Done. Shell: ssh mac   Files: ' ~ u26_mount_point ~ '   Logs: ~/.local/state/mac-link/'
+             if mac_info_file is file else
+             'Now run mac.yml on the Mac (see README), copy exchange/mac_info.yml back here, and re-run this playbook.' }}
