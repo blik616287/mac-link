@@ -2,7 +2,7 @@
 # Managed by Ansible (mac-link). Runs every minute from cron: keeps the user-level
 # sshd and the reverse tunnel to the u26 alive, restarting whichever is down.
 set -u
-D="{{ d }}"
+D="$HOME/{{ mac_link_dirname }}"
 LOG="$D/watchdog.log"
 LOCK="$D/watchdog.lock"
 

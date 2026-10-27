@@ -11,6 +11,7 @@ tunnel_user: mactunnel     # restricted account the Mac logs into to hold the tu
 tunnel_port: 2222          # u26 loopback port that leads to the Mac's sshd
 
 # ---- Mac ----
+mac_user: ""               # REQUIRED: your short user name on the Mac (run `id -un` there)
 mac_sshd_port: 2222        # Mac loopback port of the user-level sshd
 mac_share_path: ""         # path on the Mac to mount on the u26; "" = Mac home dir
 mac_link_dirname: .u26link # state dir in the Mac home

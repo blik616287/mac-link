@@ -1,7 +1,7 @@
 ---
 # Run on the u26 (Ubuntu):  ansible-playbook u26.yml -K
-# First run: sets up Thunderbolt networking, sshd and keys, and exports exchange/u26_info.yml.
-# Re-run after the Mac playbook has written exchange/mac_info.yml to finish the tunnel + mount.
+# Sets up Thunderbolt networking, sshd, keys, the mount watchdog, and renders
+# exchange/mac-install.sh -- a stock-macOS installer for the Mac side (see README).
 - name: U26 side of the Mac link
   hosts: localhost
   gather_facts: true
@@ -9,7 +9,7 @@
     u26_mount_point: "{{ ansible_env.HOME }}/mac"
     mac_key: "{{ ansible_env.HOME }}/.ssh/id_ed25519_mac"
     tunnel_home: "/var/lib/{{ tunnel_user }}"
-    mac_info_file: "{{ exchange_dir }}/mac_info.yml"
+    mac_keys_dir: "{{ exchange_dir }}/mac"
 
   handlers:
     - name: Reload sshd
@@ -17,6 +17,12 @@
       ansible.builtin.systemd:
         name: ssh
         state: reloaded
+
+  pre_tasks:
+    - name: Require the Mac user name
+      ansible.builtin.assert:
+        that: mac_user | default('') | length > 0
+        fail_msg: "Set mac_user (your short user name on the Mac, `id -un`) in group_vars/all.yml or pass -e mac_user=..."
 
   tasks:
     # ---------------------------------------------------------------- packages
@@ -121,7 +127,8 @@
       changed_when: "'Skipping' not in ufw_rule.stdout"
       when: "'Status: active' in ufw_status.stdout"
 
-    # -------------------------------------------------------------- keys out
+    # -------------------------------------------------------------------- keys
+    # All keys are made here, so the stock Mac needs no tools beyond what ships with it.
     - name: Ensure ~/.ssh
       ansible.builtin.file:
         path: "{{ ansible_env.HOME }}/.ssh"
@@ -135,106 +142,120 @@
       args:
         creates: "{{ mac_key }}"
 
-    - name: Read u26 public keys
+    - name: Directory for the Mac's keys
+      ansible.builtin.file:
+        path: "{{ mac_keys_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Mac sshd host key and Mac tunnel key
+      ansible.builtin.command: ssh-keygen -q -t ed25519 -N "" -C "{{ item.comment }}" -f {{ mac_keys_dir }}/{{ item.name }}
+      args:
+        creates: "{{ mac_keys_dir }}/{{ item.name }}"
+      loop:
+        - { name: ssh_host_ed25519_key, comment: mac-link-sshd }
+        - { name: tunnel_key, comment: "{{ mac_user }}@mac->u26-tunnel" }
+
+    - name: Read public keys
       ansible.builtin.slurp:
         src: "{{ item }}"
       loop:
         - "{{ mac_key }}.pub"
         - /etc/ssh/ssh_host_ed25519_key.pub
-      register: u26_keys
+        - "{{ mac_keys_dir }}/tunnel_key.pub"
+        - "{{ mac_keys_dir }}/ssh_host_ed25519_key.pub"
+      register: pubkeys
 
-    - name: Export u26 keys for the Mac playbook
+    - name: Keep the public keys (type + key, no comment)
+      ansible.builtin.set_fact:
+        u26_user_pubkey: "{{ (pubkeys.results[0].content | b64decode).split()[:2] | join(' ') }}"
+        u26_hostkey: "{{ (pubkeys.results[1].content | b64decode).split()[:2] | join(' ') }}"
+        mac_tunnel_pubkey: "{{ (pubkeys.results[2].content | b64decode).split()[:2] | join(' ') }}"
+        mac_sshd_hostkey: "{{ (pubkeys.results[3].content | b64decode).split()[:2] | join(' ') }}"
+
+    - name: Render the stock-macOS installer
+      ansible.builtin.template:
+        src: templates/mac-install.sh.j2
+        dest: "{{ exchange_dir }}/mac-install.sh"
+        mode: "0600"
+
+    # ------------------------------------------------------------ tunnel + mount
+    - name: Tunnel account ~/.ssh
+      become: true
+      ansible.builtin.file:
+        path: "{{ tunnel_home }}/.ssh"
+        state: directory
+        owner: "{{ tunnel_user }}"
+        group: "{{ tunnel_user }}"
+        mode: "0700"
+
+    - name: Authorize the Mac's tunnel key (forward-only, Thunderbolt subnet only)
+      become: true
       ansible.builtin.copy:
-        dest: "{{ exchange_dir }}/u26_info.yml"
-        mode: "0644"
+        dest: "{{ tunnel_home }}/.ssh/authorized_keys"
+        owner: "{{ tunnel_user }}"
+        group: "{{ tunnel_user }}"
+        mode: "0600"
         content: |
-          u26_user_pubkey: "{{ (u26_keys.results[0].content | b64decode).split()[:2] | join(' ') }}"
-          u26_hostkey: "{{ (u26_keys.results[1].content | b64decode).split()[:2] | join(' ') }}"
+          restrict,port-forwarding,permitlisten="127.0.0.1:{{ tunnel_port }}",from="{{ tb_subnet }}" {{ mac_tunnel_pubkey }}
 
-    # ---------------------------------------------- needs the Mac's info file
-    - name: Load Mac info
-      ansible.builtin.include_vars:
-        file: "{{ mac_info_file }}"
-      when: mac_info_file is file
+    - name: Trust the Mac's sshd host key
+      ansible.builtin.known_hosts:
+        name: mac-link
+        key: "mac-link {{ mac_sshd_hostkey }}"
+        path: "{{ ansible_env.HOME }}/.ssh/known_hosts"
 
-    - name: Finish the tunnel and mount
-      when: mac_info_file is file
-      block:
-        - name: Tunnel account ~/.ssh
-          become: true
-          ansible.builtin.file:
-            path: "{{ tunnel_home }}/.ssh"
-            state: directory
-            owner: "{{ tunnel_user }}"
-            group: "{{ tunnel_user }}"
-            mode: "0700"
+    - name: SSH alias "mac"
+      ansible.builtin.blockinfile:
+        path: "{{ ansible_env.HOME }}/.ssh/config"
+        create: true
+        mode: "0600"
+        insertbefore: BOF
+        marker: "# {mark} mac-link (managed by Ansible)"
+        block: |
+          Host mac
+              HostName 127.0.0.1
+              Port {{ tunnel_port }}
+              User {{ mac_user }}
+              HostKeyAlias mac-link
+              IdentityFile {{ mac_key }}
+              IdentitiesOnly yes
+              Ciphers aes128-gcm@openssh.com,chacha20-poly1305@openssh.com
+              ServerAliveInterval 15
+              ServerAliveCountMax 3
+              ConnectTimeout 10
 
-        - name: Authorize the Mac's tunnel key (forward-only, Thunderbolt subnet only)
-          become: true
-          ansible.builtin.copy:
-            dest: "{{ tunnel_home }}/.ssh/authorized_keys"
-            owner: "{{ tunnel_user }}"
-            group: "{{ tunnel_user }}"
-            mode: "0600"
-            content: |
-              restrict,port-forwarding,permitlisten="127.0.0.1:{{ tunnel_port }}",from="{{ tb_subnet }}" {{ mac_tunnel_pubkey }}
+    - name: Ensure ~/.local/bin
+      ansible.builtin.file:
+        path: "{{ ansible_env.HOME }}/.local/bin"
+        state: directory
+        mode: "0755"
 
-        - name: Trust the Mac's sshd host key
-          ansible.builtin.known_hosts:
-            name: mac-link
-            key: "mac-link {{ mac_sshd_hostkey }}"
-            path: "{{ ansible_env.HOME }}/.ssh/known_hosts"
+    - name: Mount watchdog script
+      ansible.builtin.template:
+        src: templates/u26-mac-mount.sh.j2
+        dest: "{{ ansible_env.HOME }}/.local/bin/mac-link-mount"
+        mode: "0755"
 
-        - name: SSH alias "mac"
-          ansible.builtin.blockinfile:
-            path: "{{ ansible_env.HOME }}/.ssh/config"
-            create: true
-            mode: "0600"
-            insertbefore: BOF
-            marker: "# {mark} mac-link (managed by Ansible)"
-            block: |
-              Host mac
-                  HostName 127.0.0.1
-                  Port {{ tunnel_port }}
-                  User {{ mac_user }}
-                  HostKeyAlias mac-link
-                  IdentityFile {{ mac_key }}
-                  IdentitiesOnly yes
-                  Ciphers aes128-gcm@openssh.com,chacha20-poly1305@openssh.com
-                  ServerAliveInterval 15
-                  ServerAliveCountMax 3
-                  ConnectTimeout 10
+    - name: Run the mount watchdog every minute
+      ansible.builtin.cron:
+        name: mac-link mount watchdog
+        job: "{{ ansible_env.HOME }}/.local/bin/mac-link-mount"
 
-        - name: Ensure ~/.local/bin
-          ansible.builtin.file:
-            path: "{{ ansible_env.HOME }}/.local/bin"
-            state: directory
-            mode: "0755"
+    - name: Run the mount watchdog at boot
+      ansible.builtin.cron:
+        name: mac-link mount watchdog (boot)
+        special_time: reboot
+        job: "sleep 30 && {{ ansible_env.HOME }}/.local/bin/mac-link-mount"
 
-        - name: Mount watchdog script
-          ansible.builtin.template:
-            src: templates/u26-mac-mount.sh.j2
-            dest: "{{ ansible_env.HOME }}/.local/bin/mac-link-mount"
-            mode: "0755"
-
-        - name: Run the mount watchdog every minute
-          ansible.builtin.cron:
-            name: mac-link mount watchdog
-            job: "{{ ansible_env.HOME }}/.local/bin/mac-link-mount"
-
-        - name: Run the mount watchdog at boot
-          ansible.builtin.cron:
-            name: mac-link mount watchdog (boot)
-            special_time: reboot
-            job: "sleep 30 && {{ ansible_env.HOME }}/.local/bin/mac-link-mount"
-
-        - name: Try mounting now
-          ansible.builtin.command: "{{ ansible_env.HOME }}/.local/bin/mac-link-mount"
-          changed_when: false
+    - name: Try mounting now
+      ansible.builtin.command: "{{ ansible_env.HOME }}/.local/bin/mac-link-mount"
+      changed_when: false
 
     - name: Next step
       ansible.builtin.debug:
-        msg: >-
-          {{ 'Done. Shell: ssh mac   Files: ' ~ u26_mount_point ~ '   Logs: ~/.local/state/mac-link/'
-             if mac_info_file is file else
-             'Now run mac.yml on the Mac (see README), copy exchange/mac_info.yml back here, and re-run this playbook.' }}
+        msg:
+          - "u26 side done. On the Mac (Terminal, over the Thunderbolt cable) run once:"
+          - "scp {{ ansible_user_id }}@{{ tb_u26_ip }}:{{ exchange_dir }}/mac-install.sh ~/ && bash ~/mac-install.sh && rm ~/mac-install.sh"
+          - "Then here: ssh mac   (files at {{ u26_mount_point }}, logs in ~/.local/state/mac-link/)"
+          - "Later Mac updates from here: ansible-playbook mac.yml"

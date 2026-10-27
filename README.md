@@ -1,8 +1,9 @@
 # mac-link
 
-Shell access and a filesystem mount from an Ubuntu workstation ("u26") to a MacBook Pro
-over a direct **Thunderbolt** cable. No sudo or admin rights are needed on the Mac, and
-macOS Remote Login stays off.
+Shell access and a filesystem mount from an Ubuntu workstation ("u26") to a **stock**
+MacBook Pro over a direct **Thunderbolt** cable. Nothing is installed on the Mac: no sudo,
+no admin rights, no Homebrew, no Python, and macOS Remote Login stays off. The Mac side
+only uses tools that ship with macOS (`ssh`, `sshd`, `crontab`, `shlock`).
 
 ```
  u26 (Ubuntu, sudo)                                   Mac (no sudo)
@@ -27,37 +28,39 @@ macOS Remote Login stays off.
   - On the u26 it detaches stale sshfs mounts and remounts once the tunnel is back.
   - sshd on the u26 drops dead tunnel sessions after about 45 s, which frees port 2222.
 
+## How the automation is split
+
+Stock macOS has no Python, so Ansible can't run *on* the Mac. Instead:
+
+| Playbook  | Runs on | Does |
+|-----------|---------|------|
+| `u26.yml` | u26 | Configures the u26: Thunderbolt link, sshd and the `mactunnel` account, sshfs and its cron watchdog. Also **generates the Mac's keys** and renders `exchange/mac-install.sh`, a self-contained bash 3.2 installer for the Mac. |
+| `mac.yml` | u26, against the Mac through the tunnel | Pushes the current installer to the Mac and runs it. It uses only the `script` module, which needs no Python on the Mac. Use it for later changes. |
+
+`mac-install.sh` is idempotent. It writes everything to `~/.u26link`, installs the
+crontab entries and starts the user-level sshd and the tunnel.
+
 ## Setup
 
-Edit `group_vars/all.yml` if you want a different subnet, ports or mount path.
-
-1. **On the u26** (prompts for your sudo password):
+1. **On the u26.** Set `mac_user` in `group_vars/all.yml` to your short user name on
+   the Mac (run `id -un` there). Then run (prompts for your sudo password):
    ```bash
    ansible-playbook u26.yml -K
    ```
    Plug in the Thunderbolt cable. `ip -br addr show thunderbolt0` should show `10.77.0.1`.
 
-2. **Copy the repo to the Mac**, over the cable using your normal u26 login:
+2. **On the Mac, once.** In Terminal, using your normal u26 login over the cable:
    ```bash
-   scp -r <u26-user>@10.77.0.1:<path>/mac-link ~/
+   scp <u26-user>@10.77.0.1:<repo>/exchange/mac-install.sh ~/ && bash ~/mac-install.sh && rm ~/mac-install.sh
    ```
+   The playbook prints this exact line at the end. If macOS asks whether Terminal may
+   "administer your computer" when the crontab is installed, click **OK**. It doesn't
+   need an admin password.
 
-3. **On the Mac**, install Ansible without sudo and run the playbook:
-   ```bash
-   curl -LsSf https://astral.sh/uv/install.sh | sh   # or: python3 -m pip install --user ansible-core
-   ~/.local/bin/uv tool install ansible-core
-   cd ~/mac-link && ~/.local/bin/ansible-playbook mac.yml
-   ```
-   If macOS asks whether Terminal may "administer your computer" when the crontab is
-   installed, click **OK**. That prompt does not need an admin password.
+3. **Back on the u26**, within about a minute: `ssh mac` and `ls ~/mac`.
 
-4. **Copy the Mac's info back and finish on the u26**:
-   ```bash
-   # on the Mac
-   scp ~/mac-link/exchange/mac_info.yml <u26-user>@10.77.0.1:<path>/mac-link/exchange/
-   # on the u26
-   ansible-playbook u26.yml -K
-   ```
+Later changes: edit vars or templates, then run `ansible-playbook u26.yml -K` followed
+by `ansible-playbook mac.yml`.
 
 ## Use
 
@@ -86,4 +89,5 @@ rsync -aP dir/ mac:somewhere/  # faster for large or bulk copies
     remove the mac-link blocks from `/etc/ssh/sshd_config` and `~/.ssh/config`.
   - Mac: `crontab -e`, `kill $(cat ~/.u26link/*.pid)`, `rm -rf ~/.u26link`.
 
-`exchange/` holds per-machine public keys and is git-ignored.
+`exchange/` holds generated keys, including the **Mac's private keys** and the installer
+that embeds them. It is git-ignored. Keep it to yourself.
